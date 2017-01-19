@@ -16,26 +16,23 @@
  */
 package com.emc.storageos.db.client.model.uimodels;
 
-import java.net.URI;
-import java.util.Calendar;
-import java.util.Date;
-
-import org.apache.commons.lang.builder.ToStringBuilder;
-import org.apache.commons.lang.builder.ToStringStyle;
-
 import com.emc.storageos.db.client.model.AlternateId;
 import com.emc.storageos.db.client.model.Cf;
-import com.emc.storageos.db.client.model.DecommissionedIndex;
+import com.emc.storageos.db.client.model.ClassNameTimeSeries;
 import com.emc.storageos.db.client.model.ModelObject;
 import com.emc.storageos.db.client.model.Name;
 import com.emc.storageos.db.client.model.NamedURI;
 import com.emc.storageos.db.client.model.RelationIndex;
+import com.emc.storageos.db.client.model.TimeSeriesAlternateId;
 import com.emc.storageos.model.valid.EnumType;
+import java.net.URI;
+import java.util.Calendar;
+import java.util.Date;
 
 @Cf("Order")
 public class Order extends ModelObject implements TenantDataObject {
-
     public static final String SUBMITTED_BY_USER_ID = "submittedByUserId";
+    public static final String SUBMITTED = "indexed";
     public static final String CATALOG_SERVICE_ID = "catalogServiceId";
     public static final String EXECUTION_STATE_ID = "executionStateId";
     public static final String SUMMARY = "summary";
@@ -145,7 +142,7 @@ public class Order extends ModelObject implements TenantDataObject {
         setChanged(ORDER_STATUS);
     }
 
-    @AlternateId("UserToOrders")
+    @ClassNameTimeSeries("UserToOrdersByTimeStamp")
     @Name(SUBMITTED_BY_USER_ID)
     public String getSubmittedByUserId() {
         return submittedByUserId;
@@ -220,16 +217,18 @@ public class Order extends ModelObject implements TenantDataObject {
     @Override
     public void markUpdated() {
         super.markUpdated();
-        setIndexed(Boolean.TRUE);
+        if (indexed == null ) {
+            setIndexed(Boolean.TRUE);
+        }
     }
 
     /**
      * Return value of indexed field
-     * 
+     *
      * @return
      */
     @Name("indexed")
-    @DecommissionedIndex("timeseriesIndex")
+    @TimeSeriesAlternateId("AllOrdersByTimeStamp")
     public Boolean getIndexed() {
         return indexed;
     }
@@ -241,7 +240,30 @@ public class Order extends ModelObject implements TenantDataObject {
 
     @Override
     public String toString() {
-        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
+        StringBuilder builder = new StringBuilder();
+        builder.append("\nOrderId:")
+                .append(getId())
+                .append("\nOrder Number:")
+                .append(getOrderNumber())
+                .append("\nSubmitted By:")
+                .append(getSubmittedByUserId())
+                .append("\nDate Submitted:")
+                .append(getCreationTime().getTime())
+                .append("\nDate Completed:")
+                .append(getDateCompleted().getTime())
+                .append("\nMessage:")
+                .append(getMessage())
+                .append("\nStatus:")
+                .append(getOrderStatus())
+                .append("\nCatalog ID:")
+                .append(getCatalogServiceId())
+                .append("\nTenant ID:")
+                .append(getTenant())
+                .append("\nScheduled Event ID:")
+                .append(getScheduledEventId())
+                .append("\n");
+
+        return builder.toString();
     }
 
     @Override

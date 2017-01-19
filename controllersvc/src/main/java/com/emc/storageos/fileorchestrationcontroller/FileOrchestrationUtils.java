@@ -9,17 +9,35 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.emc.storageos.db.client.DbClient;
+import com.emc.storageos.db.client.URIUtil;
 import com.emc.storageos.db.client.constraint.ContainmentConstraint;
 import com.emc.storageos.db.client.model.CifsShareACL;
 import com.emc.storageos.db.client.model.FileExport;
 import com.emc.storageos.db.client.model.FileExportRule;
+import com.emc.storageos.db.client.model.FilePolicy;
+import com.emc.storageos.db.client.model.FilePolicy.FilePolicyApplyLevel;
 import com.emc.storageos.db.client.model.FileShare;
+import com.emc.storageos.db.client.model.NASServer;
+import com.emc.storageos.db.client.model.NFSShareACL;
+import com.emc.storageos.db.client.model.PhysicalNAS;
+import com.emc.storageos.db.client.model.PolicyStorageResource;
+import com.emc.storageos.db.client.model.Project;
+import com.emc.storageos.db.client.model.StorageSystem;
+import com.emc.storageos.db.client.model.StringSet;
+import com.emc.storageos.db.client.model.VirtualPool;
 import com.emc.storageos.db.client.util.CustomQueryUtility;
 import com.emc.storageos.model.file.ExportRule;
+import com.emc.storageos.model.file.FileNfsACLUpdateParams;
+import com.emc.storageos.model.file.NfsACE;
 import com.emc.storageos.model.file.ShareACL;
+import com.emc.storageos.volumecontroller.FileControllerConstants;
 
 /**
  * File orchestration Utility Class
@@ -27,7 +45,12 @@ import com.emc.storageos.model.file.ShareACL;
  * @author Mudit Jain
  */
 
-public class FileOrchestrationUtils {
+public final class FileOrchestrationUtils {
+    private static final Logger _log = LoggerFactory.getLogger(FileOrchestrationUtils.class);
+
+    private FileOrchestrationUtils() {
+
+    }
 
     /**
      * This method generates export map for the file system export rules.
@@ -264,5 +287,203 @@ public class FileOrchestrationUtils {
             }
         }
         return shareACLMap;
+    }
+
+    public static HashMap<String, NfsACE> getUserToNFSACEMap(List<NfsACE> nfsACL) {
+        HashMap<String, NfsACE> aclMap = new HashMap<String, NfsACE>();
+        if (nfsACL != null && !nfsACL.isEmpty()) {
+            String user = null;
+            String domain = null;
+            for (NfsACE ace : nfsACL) {
+                domain = ace.getDomain();
+                user = ace.getUser();
+                user = domain == null ? "null+" + user : domain + "+" + user;
+                if (user != null && !user.isEmpty()) {
+                    aclMap.put(user, ace);
+                }
+            }
+        }
+        return aclMap;
+    }
+
+    public static Map<String, List<NfsACE>> queryNFSACL(FileShare fs, DbClient dbClient) {
+
+        Map<String, List<NfsACE>> map = new HashMap<String, List<NfsACE>>();
+        ContainmentConstraint containmentConstraint = ContainmentConstraint.Factory.getFileNfsAclsConstraint(fs.getId());
+        List<NFSShareACL> nfsAclList = CustomQueryUtility
+                .queryActiveResourcesByConstraint(dbClient, NFSShareACL.class, containmentConstraint);
+
+        if (nfsAclList != null) {
+            Iterator<NFSShareACL> aclIter = nfsAclList.iterator();
+            while (aclIter.hasNext()) {
+                NFSShareACL dbNFSAcl = aclIter.next();
+                String fsPath = dbNFSAcl.getFileSystemPath();
+                NfsACE ace = convertNFSShareACLToNfsACE(dbNFSAcl);
+                if (map.get(fsPath) == null) {
+                    List<NfsACE> acl = new ArrayList<NfsACE>();
+                    acl.add(ace);
+                    map.put(fsPath, acl);
+                } else {
+                    map.get(fsPath).add(ace);
+                }
+            }
+        }
+        return map;
+    }
+
+    public static NfsACE convertNFSShareACLToNfsACE(NFSShareACL dbNFSAcl) {
+        NfsACE dest = new NfsACE();
+
+        dest.setDomain(dbNFSAcl.getDomain());
+        dest.setPermissions(dbNFSAcl.getPermissions());
+        dest.setPermissionType(FileControllerConstants.NFS_FILE_PERMISSION_TYPE_ALLOW);
+        if (dbNFSAcl.getPermissionType() != null && !dbNFSAcl.getPermissionType().isEmpty()) {
+            dest.setPermissionType(dbNFSAcl.getPermissionType());
+        }
+        dest.setType("user");
+        if (dbNFSAcl.getType() != null && !dbNFSAcl.getType().isEmpty()) {
+            dest.setType(dbNFSAcl.getType());
+        }
+        dest.setUser(dbNFSAcl.getUser());
+        return dest;
+    }
+
+    public static FileNfsACLUpdateParams getFileNfsACLUpdateParamWithSubDir(String fsPath, FileShare fs) {
+        FileNfsACLUpdateParams params = new FileNfsACLUpdateParams();
+        if (!fsPath.equals(fs.getPath())) {
+            // Sub directory NFS ACL
+            String subDir = fsPath.split(fs.getPath())[1];
+            params.setSubDir(subDir.substring(1));
+        }
+        return params;
+    }
+
+    /**
+     * 
+     * @param dbClient
+     * @param vpool
+     * @param storageSystem
+     * @return
+     */
+    public static List<FilePolicy> getAllVpoolLevelPolices(DbClient dbClient, VirtualPool vpool, NASServer nasServer, URI storageSystem) {
+        List<FilePolicy> filePoliciesToCreate = new ArrayList<>();
+        StringSet fileVpoolPolicies = vpool.getFilePolicies();
+
+        if (fileVpoolPolicies != null && !fileVpoolPolicies.isEmpty()) {
+            for (String fileVpoolPolicy : fileVpoolPolicies) {
+                FilePolicy filePolicy = dbClient.queryObject(FilePolicy.class, URIUtil.uri(fileVpoolPolicy));
+                filePoliciesToCreate.add(filePolicy);
+                StringSet policyStrRes = filePolicy.getPolicyStorageResources();
+                if (policyStrRes != null && !policyStrRes.isEmpty()) {
+                    for (String policyStrRe : policyStrRes) {
+                        PolicyStorageResource strRes = dbClient.queryObject(PolicyStorageResource.class, URIUtil.uri(policyStrRe));
+                        if (strRes.getAppliedAt().toString().equals(vpool.getId().toString())
+                                && strRes.getStorageSystem().toString().equals(storageSystem.toString())
+                                && strRes.getNasServer().toString().equalsIgnoreCase(nasServer.getId().toString())) {
+                            _log.info("File Policy {} is already for vpool {} , storage system {}", filePolicy.getFilePolicyName(),
+                                    vpool.getLabel(), storageSystem.toString());
+                            filePoliciesToCreate.remove(filePolicy);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return filePoliciesToCreate;
+    }
+
+    /**
+     * 
+     * @param dbClient
+     * @param project
+     * @param storageSystem
+     * @return
+     */
+    public static List<FilePolicy> getAllProjectLevelPolices(DbClient dbClient, Project project, VirtualPool vpool, NASServer nasServer,
+            URI storageSystem) {
+        List<FilePolicy> filePoliciesToCreate = new ArrayList<>();
+        StringSet fileProjectPolicies = project.getFilePolicies();
+
+        if (fileProjectPolicies != null && !fileProjectPolicies.isEmpty()) {
+            for (String fileProjectPolicy : fileProjectPolicies) {
+                FilePolicy filePolicy = dbClient.queryObject(FilePolicy.class, URIUtil.uri(fileProjectPolicy));
+                if (!filePolicy.getFilePolicyVpool().toString().equals(vpool.getId().toString())) {
+                    continue;
+                }
+                filePoliciesToCreate.add(filePolicy);
+                StringSet policyStrRes = filePolicy.getPolicyStorageResources();
+                if (policyStrRes != null && !policyStrRes.isEmpty()) {
+                    for (String policyStrRe : policyStrRes) {
+                        PolicyStorageResource strRes = dbClient.queryObject(PolicyStorageResource.class, URIUtil.uri(policyStrRe));
+                        if (strRes.getAppliedAt().toString().equals(project.getId().toString())
+                                && strRes.getStorageSystem().toString().equals(storageSystem.toString())
+                                && strRes.getNasServer().toString().equalsIgnoreCase(nasServer.getId().toString())) {
+                            _log.info("File Policy {} is already for project {} , storage system {}", filePolicy.getFilePolicyName(),
+                                    project.getLabel(), storageSystem.toString());
+                            filePoliciesToCreate.remove(filePolicy);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return filePoliciesToCreate;
+    }
+
+    public static void updateUnAssignedResource(FilePolicy filePolicy, PolicyStorageResource policyRes, DbClient dbClient) {
+        FilePolicyApplyLevel applyLevel = FilePolicyApplyLevel.valueOf(filePolicy.getApplyAt());
+        switch (applyLevel) {
+            case vpool:
+                VirtualPool vpool = dbClient.queryObject(VirtualPool.class, policyRes.getAppliedAt());
+                vpool.removeFilePolicy(filePolicy.getId());
+                dbClient.updateObject(vpool);
+                break;
+            case project:
+                Project project = dbClient.queryObject(Project.class, policyRes.getAppliedAt());
+                project.removeFilePolicy(project, filePolicy.getId());
+                dbClient.updateObject(project);
+                break;
+            case file_system:
+                FileShare fs = dbClient.queryObject(FileShare.class, policyRes.getAppliedAt());
+                fs.removeFilePolicy(filePolicy.getId());
+                dbClient.updateObject(fs);
+                break;
+            default:
+                _log.error("Not a valid policy apply level: " + applyLevel);
+        }
+    }
+
+    public static void updateUnAssignedResource(FilePolicy filePolicy, URI unassignRes, DbClient dbClient) {
+        FilePolicyApplyLevel applyLevel = FilePolicyApplyLevel.valueOf(filePolicy.getApplyAt());
+        switch (applyLevel) {
+            case vpool:
+                VirtualPool vpool = dbClient.queryObject(VirtualPool.class, unassignRes);
+                vpool.removeFilePolicy(filePolicy.getId());
+                dbClient.updateObject(vpool);
+                break;
+            case project:
+                Project project = dbClient.queryObject(Project.class, unassignRes);
+                project.removeFilePolicy(project, filePolicy.getId());
+                dbClient.updateObject(project);
+                break;
+            case file_system:
+                FileShare fs = dbClient.queryObject(FileShare.class, unassignRes);
+                fs.removeFilePolicy(filePolicy.getId());
+                dbClient.updateObject(fs);
+                break;
+            default:
+                _log.error("Not a valid policy apply level: " + applyLevel);
+        }
+    }
+
+    public static PhysicalNAS getSystemPhysicalNAS(DbClient dbClient, StorageSystem system) {
+        List<URI> nasServers = dbClient.queryByType(PhysicalNAS.class, true);
+        List<PhysicalNAS> phyNasServers = dbClient.queryObject(PhysicalNAS.class, nasServers);
+        for (PhysicalNAS nasServer : phyNasServers) {
+            if (nasServer.getStorageDeviceURI().toString().equalsIgnoreCase(system.getId().toString())) {
+                return nasServer;
+            }
+        }
+        return null;
     }
 }
